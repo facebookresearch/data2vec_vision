@@ -9,6 +9,7 @@
 # https://github.com/facebookresearch/deit/
 # https://github.com/facebookresearch/dino
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import os
 import torch
 
@@ -22,6 +23,7 @@ from timm.data import create_transform
 from dall_e.utils import map_pixels
 from masking_generator import MaskingGenerator
 from dataset_folder import ImageFolder
+from PIL import Image
 
 
 class DataAugmentationForBEiT(object):
@@ -30,14 +32,46 @@ class DataAugmentationForBEiT(object):
         mean = IMAGENET_INCEPTION_MEAN if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_MEAN
         std = IMAGENET_INCEPTION_STD if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_STD
 
-        self.common_transform = transforms.Compose([
-            transforms.ColorJitter(0.4, 0.4, 0.4),
-            transforms.RandomHorizontalFlip(p=0.5),
-            RandomResizedCropAndInterpolationWithTwoPic(
-                size=args.input_size, second_size=args.second_input_size,
-                interpolation=args.train_interpolation, second_interpolation=args.second_interpolation,
-            ),
-        ])
+        if args.aug_level == 0:
+            print(' >>>>>> args.aug_level', args.aug_level)
+            self.common_transform = transforms.Compose([
+                transforms.CenterCrop(size=args.input_size)
+            ])
+        elif args.aug_level == 1:
+            print(' >>>>>> args.aug_level', args.aug_level)
+            self.common_transform = transforms.Compose([
+                transforms.Resize(size=int(args.input_size / .875), interpolation=Image.BICUBIC),
+                transforms.CenterCrop(size=args.input_size)
+            ])
+        elif args.aug_level == 2:
+            print(' >>>>>> args.aug_level', args.aug_level)
+            self.common_transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.Resize(size=int(args.input_size / .875), interpolation=Image.BICUBIC),
+                transforms.CenterCrop(size=args.input_size)
+            ])
+        elif args.aug_level == 3:
+            print(' >>>>>> args.aug_level', args.aug_level)
+            self.common_transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomResizedCrop(size=args.input_size, interpolation=Image.BICUBIC)
+            ])
+        elif args.aug_level == 4:
+            print(' >>>>>> args.aug_level', args.aug_level)
+            self.common_transform = transforms.Compose([
+                transforms.ColorJitter(0.4, 0.4, 0.4),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomResizedCrop(size=args.input_size, interpolation=Image.BICUBIC)
+            ])
+        else:
+            self.common_transform = transforms.Compose([
+                transforms.ColorJitter(0.4, 0.4, 0.4),
+                transforms.RandomHorizontalFlip(p=0.5),
+                RandomResizedCropAndInterpolationWithTwoPic(
+                    size=args.input_size, second_size=getattr(args, 'second_input_size', None),
+                    interpolation=args.train_interpolation, second_interpolation=getattr(args, 'second_interpolation', None),
+                ),
+            ])
 
         self.patch_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -46,7 +80,9 @@ class DataAugmentationForBEiT(object):
                 std=torch.tensor(std))
         ])
 
-        if args.discrete_vae_type == "dall-e":
+        if getattr(args, 'discrete_vae_type', None) is None:
+            self.visual_token_transform = lambda z: z
+        elif args.discrete_vae_type == "dall-e":
             self.visual_token_transform = transforms.Compose([
                 transforms.ToTensor(),
                 map_pixels,
@@ -69,10 +105,15 @@ class DataAugmentationForBEiT(object):
         )
 
     def __call__(self, image):
-        for_patches, for_visual_tokens = self.common_transform(image)
-        return \
-            self.patch_transform(for_patches), self.visual_token_transform(for_visual_tokens), \
-            self.masked_position_generator()
+        z = self.common_transform(image)
+        if isinstance(z, tuple):
+            for_patches, for_visual_tokens = z
+            return \
+                self.patch_transform(for_patches), self.visual_token_transform(for_visual_tokens), \
+                self.masked_position_generator()
+        else:
+            return self.patch_transform(z), self.masked_position_generator()
+
 
     def __repr__(self):
         repr = "(DataAugmentationForBEiT,\n"
@@ -104,21 +145,32 @@ def build_dataset(is_train, args):
             print(t)
     print("---------------------------")
 
+    is_valid_file = None
+
+    if is_train:
+        file_filter = getattr(args, "data_set_filter_file", None)
+        if file_filter is not None:
+            files = set()
+            with open(file_filter) as ff:
+                for l in ff:
+                    files.add(l.rstrip())
+            is_valid_file = lambda p: os.path.basename(p) in files
+
     if args.data_set == 'CIFAR':
         dataset = datasets.CIFAR100(args.data_path, train=is_train, transform=transform)
         nb_classes = 100
     elif args.data_set == 'IMNET':
         root = os.path.join(args.data_path, 'train' if is_train else 'val')
-        dataset = datasets.ImageFolder(root, transform=transform)
+        dataset = datasets.ImageFolder(root, transform=transform, is_valid_file=is_valid_file)
         nb_classes = 1000
     elif args.data_set == "image_folder":
         root = args.data_path if is_train else args.eval_data_path
-        dataset = ImageFolder(root, transform=transform)
+        dataset = ImageFolder(root, transform=transform, is_valid_file=is_valid_file)
         nb_classes = args.nb_classes
         assert len(dataset.class_to_idx) == nb_classes
     else:
         raise NotImplementedError()
-    assert nb_classes == args.nb_classes
+    assert nb_classes == args.nb_classes, f"{nb_classes} != {args.nb_classes}"
     print("Number of the class = %d" % args.nb_classes)
 
     return dataset, nb_classes

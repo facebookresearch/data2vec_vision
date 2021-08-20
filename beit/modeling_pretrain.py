@@ -8,6 +8,7 @@
 # https://github.com/rwightman/pytorch-image-models/tree/master/timm
 # https://github.com/facebookresearch/deit/
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import math
 import torch
 import torch.nn as nn
@@ -121,7 +122,7 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
 
         rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
         for blk in self.blocks:
-            x = blk(x, rel_pos_bias=rel_pos_bias)
+            x, _ = blk(x, rel_pos_bias=rel_pos_bias)
 
         return self.norm(x)
 

@@ -9,6 +9,7 @@
 # https://github.com/facebookresearch/deit
 # https://github.com/facebookresearch/dino
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import io
 import os
 import math
@@ -203,10 +204,14 @@ def _load_checkpoint_for_ema(model_ema, checkpoint):
     """
     Workaround for ModelEma._load_checkpoint to accept an already-loaded object
     """
-    mem_file = io.BytesIO()
-    torch.save(checkpoint, mem_file)
-    mem_file.seek(0)
-    model_ema._load_checkpoint(mem_file)
+
+    if hasattr(model_ema, "module"):
+        model_ema.module.load_state_dict(checkpoint['model_ema'])
+    else:
+        mem_file = io.BytesIO()
+        torch.save(checkpoint, mem_file)
+        mem_file.seek(0)
+        model_ema._load_checkpoint(mem_file)
 
 
 def setup_for_distributed(is_master):
@@ -263,13 +268,32 @@ def init_distributed_mode(args):
         os.environ['RANK'] = str(args.rank)
         os.environ['WORLD_SIZE'] = str(args.world_size)
         # ["RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"]
-    elif 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+    elif 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and 'SLURM_NODEID' not in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
+    elif 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and 'SLURM_NODEID' in os.environ:
+        # args.rank = int(os.environ["RANK"])
+        # print(os.environ)
+
+        gpus_per_node = torch.cuda.device_count()
+        node_id = int(os.environ.get("SLURM_NODEID"))
+        args.rank = int(os.environ["RANK"]) + node_id * gpus_per_node
+
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.gpu = int(os.environ['LOCAL_RANK'])
     elif 'SLURM_PROCID' in os.environ:
+        os.environ['RANK'] = os.environ['SLURM_PROCID']
         args.rank = int(os.environ['SLURM_PROCID'])
+        os.environ['LOCAL_RANK'] = str(args.rank % torch.cuda.device_count())
         args.gpu = args.rank % torch.cuda.device_count()
+        print("utils.py SLURM_PROCID in os.environ")
+        print("args.rank "+str(args.rank))
+        print("args.gpu "+str(args.gpu))
+        print("args.world_size "+str(args.world_size))
+        print("SLURM_NTASKS "+str(os.environ['SLURM_NTASKS']))
+        assert int(args.world_size) == int(os.environ['SLURM_NTASKS'])
+        os.environ['WORLD_SIZE'] = str(args.world_size)
     else:
         print('Not using distributed mode')
         args.distributed = False
@@ -279,11 +303,11 @@ def init_distributed_mode(args):
 
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
-    print('| distributed init (rank {}): {}, gpu {}'.format(
-        args.rank, args.dist_url, args.gpu), flush=True)
+    print('| distributed init (rank {}): {}, gpu {}, world_size {}'.format(
+        args.rank, args.dist_url, args.gpu, args.world_size), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                          world_size=args.world_size, rank=args.rank)
-    torch.distributed.barrier()
+    # torch.distributed.init_process_group(backend=args.dist_backend, init_method='env://')
     setup_for_distributed(args.rank == 0)
 
 
@@ -399,6 +423,40 @@ def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epoch
     assert len(schedule) == epochs * niter_per_ep
     return schedule
 
+def tri_phase_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_perc=0.05, decay_perc=0.05,
+                     start_warmup_value=0):
+
+    assert warmup_perc + decay_perc <= 1
+
+    total_updates = int(epochs * niter_per_ep)
+
+    warmup_iters = int(warmup_perc * total_updates)
+    decay_iters = int(decay_perc * total_updates)
+    hold_iters = total_updates - warmup_iters - decay_iters
+
+    print("Set warmup steps = %d" % warmup_iters)
+    if warmup_iters > 0:
+        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+    else:
+        warmup_schedule = np.array([])
+
+    if hold_iters > 0:
+        hold_schedule = np.full(hold_iters, base_value)
+    else:
+        hold_schedule = np.array([])
+
+    if decay_iters > 0:
+        decay_schedule = np.linspace(base_value, final_value, decay_iters)
+    else:
+        decay_schedule = np.array([])
+
+    schedule = np.concatenate((warmup_schedule, hold_schedule, decay_schedule))
+
+    assert len(schedule) == epochs * niter_per_ep, \
+        f"e: {epochs}, it: {niter_per_ep}, tot: {epochs*niter_per_ep}, " \
+        f"w: {warmup_iters}, h: {hold_iters}, d: {decay_iters}, len: {len(schedule)}"
+    return schedule
+
 
 def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, model_ema=None):
     output_dir = Path(args.output_dir)
@@ -431,12 +489,15 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
         # torch.amp
         if args.auto_resume and len(args.resume) == 0:
             import glob
-            all_checkpoints = glob.glob(os.path.join(output_dir, 'checkpoint-*.pth'))
+            all_checkpoints = glob.glob(os.path.join(glob.escape(output_dir), 'checkpoint-*.pth'))
             latest_ckpt = -1
             for ckpt in all_checkpoints:
                 t = ckpt.split('-')[-1].split('.')[0]
                 if t.isdigit():
                     latest_ckpt = max(int(t), latest_ckpt)
+
+            print(output_dir, latest_ckpt, all_checkpoints)
+
             if latest_ckpt >= 0:
                 args.resume = os.path.join(output_dir, 'checkpoint-%d.pth' % latest_ckpt)
             print("Auto resume checkpoint: %s" % args.resume)
@@ -449,7 +510,7 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
                 checkpoint = torch.load(args.resume, map_location='cpu')
             model_without_ddp.load_state_dict(checkpoint['model'])
             print("Resume checkpoint %s" % args.resume)
-            if 'optimizer' in checkpoint and 'epoch' in checkpoint:
+            if 'optimizer' in checkpoint and 'epoch' in checkpoint and not getattr(args, "reset_resume", False): # and len(getattr(args, "seed_model", '') or []) == 0:
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 args.start_epoch = checkpoint['epoch'] + 1
                 if hasattr(args, 'model_ema') and args.model_ema:

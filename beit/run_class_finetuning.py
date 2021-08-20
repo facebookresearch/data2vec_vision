@@ -9,11 +9,13 @@
 # https://github.com/facebookresearch/deit
 # https://github.com/facebookresearch/dino
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import argparse
 import datetime
 import numpy as np
 import time
 import torch
+import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import json
 import os
@@ -146,6 +148,11 @@ def get_args():
     parser.set_defaults(use_mean_pooling=True)
     parser.add_argument('--use_cls', action='store_false', dest='use_mean_pooling')
     parser.add_argument('--disable_weight_decay_on_rel_pos_bias', action='store_true', default=False)
+    parser.add_argument('--target_layer', default=-1, type=int, help="target output layer (0-based)")
+    parser.add_argument('--remove_final_norm', action='store_true', dest='remove_final_norm')
+    parser.add_argument('--reinit_final_norm', action='store_true', dest='reinit_final_norm')
+    parser.add_argument('--learn_layer_weights', action='store_true', dest='learn_layer_weights')  # supersede `target_layer`
+    parser.add_argument('--layernorm_before_combine', action='store_true', dest='layernorm_before_combine')
 
     # Dataset parameters
     parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
@@ -154,10 +161,13 @@ def get_args():
                         help='dataset path for evaluation')
     parser.add_argument('--nb_classes', default=0, type=int,
                         help='number of the classification types')
+    parser.add_argument('--linear_classifier', action='store_true',
+                        help='linear classifier')
     parser.add_argument('--imagenet_default_mean_and_std', default=False, action='store_true')
 
     parser.add_argument('--data_set', default='IMNET', choices=['CIFAR', 'IMNET', 'image_folder'],
                         type=str, help='ImageNet dataset path')
+    parser.add_argument('--data_set_filter_file', type=str, default=None, help="path to filter to filter dataset")
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default=None,
@@ -196,6 +206,15 @@ def get_args():
                         help='url used to set up distributed training')
 
     parser.add_argument('--enable_deepspeed', action='store_true', default=False)
+
+    parser.add_argument(
+        "--num_mask_patches",
+        default=0,
+        type=int,
+        help="number of the visual tokens/patches need be masked",
+    )
+    parser.add_argument("--max_mask_patches_per_block", type=int, default=None)
+    parser.add_argument("--min_mask_patches_per_block", type=int, default=16)
 
     known_args, _ = parser.parse_known_args()
 
@@ -302,15 +321,29 @@ def main(args, ds_init):
         drop_block_rate=None,
         use_mean_pooling=args.use_mean_pooling,
         init_scale=args.init_scale,
-        use_rel_pos_bias=args.rel_pos_bias,
+        use_rel_pos_bias=False,
+        use_shared_rel_pos_bias=args.rel_pos_bias,
         use_abs_pos_emb=args.abs_pos_emb,
         init_values=args.layer_scale_init_value,
+        linear_classifier=args.linear_classifier,
+        has_masking=args.num_mask_patches > 0,
+        learn_layer_weights=args.learn_layer_weights,
+        layernorm_before_combine=args.layernorm_before_combine,
     )
 
     patch_size = model.patch_embed.patch_size
     print("Patch size = %s" % str(patch_size))
     args.window_size = (args.input_size // patch_size[0], args.input_size // patch_size[1])
     args.patch_size = patch_size
+
+    masked_position_generator = None
+    if args.num_mask_patches > 0:
+        from masking_generator import MaskingGenerator
+        masked_position_generator = MaskingGenerator(
+            args.window_size, num_masking_patches=args.num_mask_patches,
+            max_num_patches=args.max_mask_patches_per_block,
+            min_num_patches=args.min_mask_patches_per_block,
+        )
 
     if args.finetune:
         if args.finetune.startswith('https'):
@@ -333,6 +366,11 @@ def main(args, ds_init):
             if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
                 print(f"Removing key {k} from pretrained checkpoint")
                 del checkpoint_model[k]
+        if args.reinit_final_norm:
+            for k in ['norm.weight', 'norm.bias', 'fc_norm.weight', 'fc_norm.bias']:
+                if k in checkpoint_model:
+                    print(f"Removing key {k} from pretrained checkpoint")
+                    del checkpoint_model[k]
 
         if model.use_rel_pos_bias and "rel_pos_bias.relative_position_bias_table" in checkpoint_model:
             print("Expand the shared relative position embedding to each transformer block. ")
@@ -432,6 +470,26 @@ def main(args, ds_init):
                 pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
                 new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
                 checkpoint_model['pos_embed'] = new_pos_embed
+
+        if not args.learn_layer_weights and args.target_layer != -1:
+            print(f"model target layer is {args.target_layer}")
+            model.blocks = model.blocks[:args.target_layer+1]
+
+        if args.remove_final_norm:
+            print(f"removing final norm by replacing it with Identity")
+            model.norm = None if model.norm is None else nn.Identity()
+            model.fc_norm = None if model.fc_norm is None else nn.Identity()
+
+        if args.linear_classifier:
+            frozen_params = (
+                set(n for n, _ in model.named_parameters())
+                & set(checkpoint_model.keys())
+            )
+            for n, p in model.named_parameters():
+                if n in frozen_params:
+                    p.requires_grad_(False)
+            param_names = [n for n, p in model.named_parameters() if p.requires_grad]
+            print(f"Trainable weights: {param_names}")
 
         utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
         # model.load_state_dict(checkpoint_model, strict=False)
@@ -543,6 +601,7 @@ def main(args, ds_init):
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
+            masked_position_generator=masked_position_generator,
         )
         if args.output_dir and args.save_ckpt:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:

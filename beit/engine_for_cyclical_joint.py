@@ -9,25 +9,31 @@
 # https://github.com/facebookresearch/deit/
 # https://github.com/facebookresearch/dino
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import math
 import sys
 from typing import Iterable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import utils
 
 
-def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
+def train_one_epoch(model: torch.nn.Module, model_ema: torch.nn.Module, ema_start_at, target_layers,
+                    d_vae: torch.nn.Module, vae_loss_weight: float,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
+                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0, l1_beta: float = 0.12,
                     log_writer=None, lr_scheduler=None, start_steps=None,
-                    lr_schedule_values=None, wd_schedule_values=None):
+                    lr_schedule_values=None, wd_schedule_values=None, l2_loss=False):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('loss_cyc', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('loss_beit', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
@@ -48,14 +54,35 @@ def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
         bool_masked_pos = bool_masked_pos.to(device, non_blocking=True)
 
         with torch.no_grad():
+            targets = model_ema.module(samples, bool_masked_pos=None, return_all_tokens=True, layer_results=True)
+            fsz = targets[0].size(-1)
+
+            targets = sum(F.layer_norm(targets[i], (fsz,)) for i in target_layers) / len(target_layers)
+
+            fsz = targets.size(-1)
+            target_mask = bool_masked_pos.flatten().bool()
+            targets = targets.reshape(-1, fsz)[target_mask]
+
+            # beit part
             input_ids = d_vae.get_codebook_indices(images).flatten(1)
             bool_masked_pos = bool_masked_pos.flatten(1).to(torch.bool)
             labels = input_ids[bool_masked_pos]
 
         with torch.cuda.amp.autocast():
-            outputs = model(samples, bool_masked_pos=bool_masked_pos, return_all_tokens=False)
-            loss = nn.CrossEntropyLoss()(input=outputs, target=labels)
+            outputs, beit_outputs = model(samples, bool_masked_pos=bool_masked_pos, return_all_tokens=False)
+            outputs = outputs.reshape(-1, fsz)
+            assert outputs.shape == targets.shape
+            if l2_loss:
+                cyc_loss = F.mse_loss(outputs, targets)
+            else:
+                cyc_loss = F.smooth_l1_loss(outputs, targets, beta=l1_beta)
 
+            # beit part
+            beit_loss = nn.CrossEntropyLoss()(input=beit_outputs, target=labels)
+
+        # loss = cyc_loss / (vae_loss_weight + 1) + beit_loss * vae_loss_weight / (vae_loss_weight + 1)
+        beit_w = max(1 - (epoch / vae_loss_weight), 0)
+        loss = cyc_loss * (1 - beit_w) + beit_loss * beit_w
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
@@ -69,16 +96,20 @@ def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
                                 parameters=model.parameters(), create_graph=is_second_order)
         loss_scale_value = loss_scaler.state_dict()["scale"]
 
+        if it == ema_start_at and ema_start_at > 0:
+            print(f"setting EMA to model params at update {it}")
+            model_ema.set(model)
+        elif it >= ema_start_at:
+            model_ema.update(model)
         torch.cuda.synchronize()
-
-        mlm_acc = (outputs.max(-1)[1] == labels).float().mean().item()
-
-        metric_logger.update(mlm_acc=mlm_acc)
-        if log_writer is not None:
-            log_writer.update(mlm_acc=mlm_acc, head="loss")
 
         metric_logger.update(loss=loss_value)
         metric_logger.update(loss_scale=loss_scale_value)
+        metric_logger.update(loss_cyc=cyc_loss.item())
+        metric_logger.update(loss_beit=beit_loss.item())
+        # metric_logger.update(loss_cyc=cyc_loss.item(), head="loss_cyc")
+        # metric_logger.update(loss_beit=beit_loss.item(), head="loss_beit")
+
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
@@ -96,6 +127,8 @@ def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
 
         if log_writer is not None:
             log_writer.update(loss=loss_value, head="loss")
+            log_writer.update(loss=cyc_loss.item(), head="loss_cyc")
+            log_writer.update(loss=beit_loss.item(), head="loss_beit")
             log_writer.update(loss_scale=loss_scale_value, head="opt")
             log_writer.update(lr=max_lr, head="opt")
             log_writer.update(min_lr=min_lr, head="opt")
@@ -106,6 +139,7 @@ def train_one_epoch(model: torch.nn.Module, d_vae: torch.nn.Module,
 
         if lr_scheduler is not None:
             lr_scheduler.step_update(start_steps + step)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)

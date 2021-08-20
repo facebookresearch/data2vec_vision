@@ -9,6 +9,7 @@
 # https://github.com/facebookresearch/deit/
 # https://github.com/facebookresearch/dino
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import math
 from functools import partial
 
@@ -156,6 +157,7 @@ class Block(nn.Module):
                  drop_path=0., init_values=None, act_layer=nn.GELU, norm_layer=nn.LayerNorm,
                  window_size=None, attn_head_dim=None):
         super().__init__()
+
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
@@ -175,11 +177,13 @@ class Block(nn.Module):
     def forward(self, x, rel_pos_bias=None):
         if self.gamma_1 is None:
             x = x + self.drop_path(self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
+            fc_feature = self.drop_path(self.mlp(self.norm2(x)))
+            x = x + fc_feature
         else:
             x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
-            x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
-        return x
+            fc_feature = self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
+            x = x + fc_feature
+        return x, fc_feature
 
 
 class PatchEmbed(nn.Module):
@@ -252,7 +256,8 @@ class VisionTransformer(nn.Module):
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
-                 use_mean_pooling=True, init_scale=0.001):
+                 use_mean_pooling=True, init_scale=0.001, linear_classifier=False, has_masking=False,
+                 learn_layer_weights=False, layernorm_before_combine=False):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
@@ -262,7 +267,10 @@ class VisionTransformer(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        if has_masking:
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
         if use_abs_pos_emb:
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         else:
@@ -282,17 +290,24 @@ class VisionTransformer(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
                 init_values=init_values, window_size=self.patch_embed.patch_shape if use_rel_pos_bias else None)
             for i in range(depth)])
+        self.use_mean_pooling = use_mean_pooling
         self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
-        self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
+        self.fc_norm = norm_layer(embed_dim, elementwise_affine=not linear_classifier) if use_mean_pooling else None
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
-        # trunc_normal_(self.mask_token, std=.02)
+        if has_masking:
+            trunc_normal_(self.mask_token, std=.02)
         trunc_normal_(self.head.weight, std=.02)
         self.apply(self._init_weights)
         self.fix_init_weight()
+
+        self.learn_layer_weights = learn_layer_weights
+        self.layernorm_before_combine = layernorm_before_combine
+        if learn_layer_weights:
+            self.layer_log_weights = nn.Parameter(torch.zeros(depth,))
 
         self.head.weight.data.mul_(init_scale)
         self.head.bias.data.mul_(init_scale)
@@ -311,8 +326,10 @@ class VisionTransformer(nn.Module):
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1.0)
 
     def get_num_layers(self):
         return len(self.blocks)
@@ -328,29 +345,51 @@ class VisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x):
+    def forward_features(self, x, bool_masked_pos=None):
         x = self.patch_embed(x)
         batch_size, seq_len, _ = x.size()
 
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+
+        if bool_masked_pos is not None and self.training:
+            mask_token = self.mask_token.expand(batch_size, seq_len, -1)
+            # replace the masked visual tokens by mask_token
+            w = bool_masked_pos.view(bool_masked_pos.size(0), -1, 1).type_as(mask_token)
+            x = x * (1 - w) + mask_token * w
+
         x = torch.cat((cls_tokens, x), dim=1)
         if self.pos_embed is not None:
             x = x + self.pos_embed
         x = self.pos_drop(x)
 
         rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
+        layer_xs = []
         for blk in self.blocks:
-            x = blk(x, rel_pos_bias=rel_pos_bias)
+            x, _ = blk(x, rel_pos_bias=rel_pos_bias)  # B x T x C
+            layer_xs.append(x)
 
-        x = self.norm(x)
-        if self.fc_norm is not None:
-            t = x[:, 1:, :]
-            return self.fc_norm(t.mean(1))
+        if self.learn_layer_weights:
+            layer_xs = [
+                layer_x.mean(1) if self.use_mean_pooling else layer_x[:, 0]
+                for layer_x in layer_xs
+            ]
+            layer_xs = [
+                F.layer_norm(layer_x.float(), layer_x.shape[-1:])
+                if self.layernorm_before_combine else layer_x
+                for layer_x in layer_xs
+            ]
+            weights = self.layer_log_weights.softmax(-1)
+            return F.linear(torch.stack(layer_xs, -1), weights)
         else:
-            return x[:, 0]
+            x = self.norm(x)
+            if self.fc_norm is not None:
+                t = x[:, 1:, :]
+                return self.fc_norm(t.mean(1))
+            else:
+                return x[:, 0]
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, x, bool_masked_pos=None):
+        x = self.forward_features(x, bool_masked_pos)
         x = self.head(x)
         return x
 

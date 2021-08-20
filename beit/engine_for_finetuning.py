@@ -9,6 +9,7 @@
 # https://github.com/facebookresearch/deit/
 # https://github.com/facebookresearch/dino
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import math
 import sys
 from typing import Iterable, Optional
@@ -21,8 +22,8 @@ from timm.utils import accuracy, ModelEma
 import utils
 
 
-def train_class_batch(model, samples, target, criterion):
-    outputs = model(samples)
+def train_class_batch(model, samples, target, criterion, bool_masked_pos=None):
+    outputs = model(samples, bool_masked_pos=bool_masked_pos)
     loss = criterion(outputs, target)
     return loss, outputs
 
@@ -37,7 +38,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None, log_writer=None,
                     start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
-                    num_training_steps_per_epoch=None, update_freq=None):
+                    num_training_steps_per_epoch=None, update_freq=None, masked_position_generator=None):
     model.train(True)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -64,6 +65,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 if wd_schedule_values is not None and param_group["weight_decay"] > 0:
                     param_group["weight_decay"] = wd_schedule_values[it]
 
+        bool_masked_pos = None
+        if masked_position_generator is not None:
+            bool_masked_pos = torch.tensor([masked_position_generator() for _ in range(samples.size(0))], device=device)
+
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -73,16 +78,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if loss_scaler is None:
             samples = samples.half()
             loss, output = train_class_batch(
-                model, samples, targets, criterion)
+                model, samples, targets, criterion, bool_masked_pos)
         else:
             with torch.cuda.amp.autocast():
                 loss, output = train_class_batch(
-                    model, samples, targets, criterion)
+                    model, samples, targets, criterion, bool_masked_pos)
 
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
+            print("Loss is {}, stopping training".format(loss_value), force=True)
             sys.exit(1)
 
         if loss_scaler is None:
