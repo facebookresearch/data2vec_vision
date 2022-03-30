@@ -9,6 +9,7 @@
 # https://github.com/facebookresearch/deit
 # https://github.com/facebookresearch/dino
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import argparse
 import datetime
 import numpy as np
@@ -34,7 +35,7 @@ def get_args():
     parser = argparse.ArgumentParser('BEiT pre-training script', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--epochs', default=300, type=int)
-    parser.add_argument('--save_ckpt_freq', default=20, type=int)
+    parser.add_argument('--save_ckpt_freq', default=10, type=int)
     parser.add_argument("--discrete_vae_weight_path", type=str)
     parser.add_argument("--discrete_vae_type", type=str, default="dall-e")
     # Model parameters
@@ -128,6 +129,7 @@ def get_args():
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--aug_level', default=-100, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
@@ -184,6 +186,7 @@ def main(args):
         sampler_rank = global_rank
         num_training_steps_per_epoch = len(dataset_train) // args.batch_size // num_tasks
 
+        print("pre-sampler", num_tasks, global_rank, sampler_rank)
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=sampler_rank, shuffle=True
         )

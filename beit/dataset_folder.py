@@ -7,6 +7,7 @@
 # Modified on torchvision code bases
 # https://github.com/pytorch/vision
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 from torchvision.datasets.vision import VisionDataset
 
 from PIL import Image
@@ -115,7 +116,9 @@ class DatasetFolder(VisionDataset):
     ) -> None:
         super(DatasetFolder, self).__init__(root, transform=transform,
                                             target_transform=target_transform)
+        print("finding classes")
         classes, class_to_idx = self._find_classes(self.root)
+        print("making dataset")
         samples = make_dataset(self.root, class_to_idx, extensions, is_valid_file)
         if len(samples) == 0:
             msg = "Found 0 files in subfolders of: {}\n".format(self.root)
@@ -130,6 +133,7 @@ class DatasetFolder(VisionDataset):
         self.class_to_idx = class_to_idx
         self.samples = samples
         self.targets = [s[1] for s in samples]
+        print("done initializing dataset folder")
 
     def _find_classes(self, dir: str) -> Tuple[List[str], Dict[str, int]]:
         """
@@ -199,6 +203,28 @@ def accimage_loader(path: str) -> Any:
 
 def default_loader(path: str) -> Any:
     from torchvision import get_image_backend
+    from shutil import copyfile
+    import os
+
+    sp = path.split('/')
+    name = sp[-1]
+    base = '/'.join(sp[:-1])
+
+    image_cache_str = "image_cache6"
+
+    # if os.path.exists('/scratch/'+image_cache_str+'/') and not os.access('/scratch/'+image_cache_str+'/', os.R_OK):
+    #     image_cache_str = "image_cache3"
+
+    if not os.path.isdir('/scratch/'+image_cache_str+'/' + base):
+        os.makedirs('/scratch/'+image_cache_str+'/'+ base)
+
+    if not os.path.exists('/scratch/'+image_cache_str+'/' + path):
+        copyfile(path, '/scratch/'+image_cache_str+'/' + path)
+    path = '/scratch/'+image_cache_str+'/' + path
+    #print('name', name)
+    #print('base', base)
+    #print('path', path)
+
     if get_image_backend() == 'accimage':
         return accimage_loader(path)
     else:
@@ -239,6 +265,7 @@ class ImageFolder(DatasetFolder):
             target_transform: Optional[Callable] = None,
             loader: Callable[[str], Any] = default_loader,
             is_valid_file: Optional[Callable[[str], bool]] = None,
+            filter: Optional[str] = None
     ):
         super(ImageFolder, self).__init__(root, loader, IMG_EXTENSIONS if is_valid_file is None else None,
                                           transform=transform,

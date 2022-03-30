@@ -7,6 +7,7 @@
 # Based on timm code bases
 # https://github.com/rwightman/pytorch-image-models/tree/master/timm
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved
 import torch
 import torchvision.transforms.functional as F
 from PIL import Image
@@ -99,7 +100,8 @@ class RandomResizedCropAndInterpolationWithTwoPic:
             self.interpolation = _RANDOM_INTERPOLATION
         else:
             self.interpolation = _pil_interp(interpolation)
-        self.second_interpolation = _pil_interp(second_interpolation)
+
+        self.second_interpolation = _pil_interp(second_interpolation) if second_interpolation is not None else None
         self.scale = scale
         self.ratio = ratio
 

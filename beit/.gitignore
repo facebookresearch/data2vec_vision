@@ -4,3 +4,5 @@ imnet_resnet50_scratch/timm_temp/
 .dumbo.json
 checkpoints/
 .idea/*
+slurm_logs/*
+core
