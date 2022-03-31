@@ -7,7 +7,7 @@
 # Based on timm code bases
 # https://github.com/rwightman/pytorch-image-models/tree/master/timm
 # --------------------------------------------------------'
-# Copyright (c) Meta Platforms, Inc. All Rights Reserved
+# Copyright (c) Meta Platforms, Inc. and affiliates
 import torch
 import torchvision.transforms.functional as F
 from PIL import Image

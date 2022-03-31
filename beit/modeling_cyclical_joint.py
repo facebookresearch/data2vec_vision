@@ -8,6 +8,7 @@
 # https://github.com/rwightman/pytorch-image-models/tree/master/timm
 # https://github.com/facebookresearch/deit/
 # --------------------------------------------------------'
+# Copyright (c) Meta Platforms, Inc. and affiliates
 import math
 import torch
 import torch.nn as nn

@@ -7,7 +7,7 @@
 # Modified on torchvision code bases
 # https://github.com/pytorch/vision
 # --------------------------------------------------------'
-# Copyright (c) Meta Platforms, Inc. All Rights Reserved
+# Copyright (c) Meta Platforms, Inc. and affiliates
 from torchvision.datasets.vision import VisionDataset
 
 from PIL import Image

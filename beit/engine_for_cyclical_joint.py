@@ -9,7 +9,7 @@
 # https://github.com/facebookresearch/deit/
 # https://github.com/facebookresearch/dino
 # --------------------------------------------------------'
-# Copyright (c) Meta Platforms, Inc. All Rights Reserved
+# Copyright (c) Meta Platforms, Inc. and affiliates
 import math
 import sys
 from typing import Iterable
