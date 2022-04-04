@@ -7,11 +7,13 @@ For details about how to setup your BEIT environment, please refer the original 
 
 ## Model Checkpoints
 
-Pretrained Model | Epochs | Link
+Pretrained Model | Version | Link
 |---|---|---|
-data2vec ViT-B | 800 | [download](https://dl.fbaipublicfiles.com/fairseq/data2vec/data2vec_vision/base_800/checkpoint-799.pth)
-data2vec ViT-L | 800 | [download](https://dl.fbaipublicfiles.com/fairseq/data2vec/data2vec_vision/large_800/checkpoint-799.pth)
-data2vec ViT-L | 1600 | [download](https://dl.fbaipublicfiles.com/fairseq/data2vec/data2vec_vision/large_1600/checkpoint-799.pth)
+data2vec ViT-B | 800 epochs pretrained | [download](https://dl.fbaipublicfiles.com/fairseq/data2vec/data2vec_vision/base_800/checkpoint-799.pth)
+data2vec ViT-L | 800 epochs pretrained | [download](https://dl.fbaipublicfiles.com/fairseq/data2vec/data2vec_vision/large_800/checkpoint-799.pth)
+data2vec ViT-L | 1600 epochs pretrained | [download](https://dl.fbaipublicfiles.com/fairseq/data2vec/data2vec_vision/large_1600/checkpoint-799.pth)
+data2vec ViT-B | Finetuned | [download](https://dl.fbaipublicfiles.com/fairseq/data2vec/data2vec_vision/finetuned_base/checkpoint-99/mp_rank_00_model_states.pt)
+data2vec ViT-L | Finetuned | [download](https://dl.fbaipublicfiles.com/fairseq/data2vec/data2vec_vision/finetuned_large/checkpoint-49/mp_rank_00_model_states.pt)
 
 ## VIT-B Pretraining and Finetuning
 
