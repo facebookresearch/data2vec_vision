@@ -16,7 +16,7 @@ setup(
                       'boto3',
                       'requests',
                       'tqdm',
-                      'urllib3==1.25.4'],
+                      'urllib3==2.6.3'],
     
     
     python_requires='>=3.5.0',
